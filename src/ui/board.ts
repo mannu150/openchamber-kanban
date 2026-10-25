@@ -22,7 +22,7 @@ import { el } from './dom.ts';
 
 export type BoardHost = Pick<
   HostClient,
-  'storage' | 'onProjects' | 'onSessions' | 'onWorktrees' | 'openSession' | 'startSession' | 'serviceRequest' | 'toast' | 'setBadge'
+  'storage' | 'onProjects' | 'onSessions' | 'onWorktrees' | 'listSessions' | 'listWorktrees' | 'openSession' | 'startSession' | 'serviceRequest' | 'toast' | 'setBadge'
 >;
 
 /**
@@ -184,8 +184,19 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     clearTaskLink(taskId, { worktree: null }, `Cleared the worktree link on "${task.title}" — that worktree was deleted.`);
   };
 
-  const sessionSync = createSessionSync(host, SYNC_OPTIONS, applyAgentStatusChange, onSessionGone);
-  const worktreeSync = createWorktreeSync(host, onWorktreeGone);
+  /**
+   * A live-watch subscription could not be established (the host's
+   * 32-per-frame cap is shared with everything else in this iframe).
+   * Nothing is lost permanently — the affected projects keep syncing
+   * through periodic reads, and reload still reads everything.
+   */
+  const onLiveSyncError = (projectId: string, error: unknown) => {
+    if (disposed) return;
+    showBanner('Live updates limited', `${describeHostError(error)} Affected projects keep syncing through periodic reads (~15s) instead of live subscriptions; Refresh always loads fresh data.`, 'warning');
+  };
+
+  const sessionSync = createSessionSync(host, SYNC_OPTIONS, applyAgentStatusChange, onSessionGone, onLiveSyncError);
+  const worktreeSync = createWorktreeSync(host, onWorktreeGone, onLiveSyncError);
 
   /** A deleted task's session stays out of automatic adoption, even after a reload. */
   let dismissedSessionIds = new Set<string>();
@@ -659,8 +670,9 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
       if (result.status !== 'fulfilled') continue;
       const { projectId, sessions, worktrees } = result.value;
       // The full session list distinguishes archived sessions from deleted ones;
-      // `complete` false means the list can't be trusted.
-      const sessionsView: SessionsView = { state: sessions.complete ? 'ready' : 'error', coverage: [], sessions: sessions.allSessions };
+      // `complete` false means the list can't be trusted — and real `coverage`
+      // is what lets a missing session count as deleted rather than unknown.
+      const sessionsView: SessionsView = { state: sessions.complete ? 'ready' : 'error', coverage: sessions.coverage, sessions: sessions.allSessions };
       const worktreesView: WorktreesView = { state: worktrees.complete ? 'ready' : 'error', worktrees: worktrees.worktrees };
       for (const task of byProject.get(projectId) ?? []) {
         // Re-read from `tasks` — a live watcher may have unlinked this task while the fetches were in flight.
@@ -734,7 +746,17 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
   void reload().finally(() => {
     spinner.dispose(); spinnerSlot.hidden = true;
     // Wait for the first load so a session already linked to a persisted task is never mistaken for an orphan.
-    if (!disposed) orphanWatcher = watchOrphanSessions(host, excludedSessionIds, (found) => adoptRunningSession(found.projectId, found.session, found.status));
+    if (!disposed) {
+      orphanWatcher = watchOrphanSessions(
+        host,
+        excludedSessionIds,
+        (found) => adoptRunningSession(found.projectId, found.session, found.status),
+        SYNC_OPTIONS,
+        (error) => {
+          if (!disposed) showBanner('Session auto-discovery degraded', `${describeHostError(error)} Sessions started outside this board may not be picked up automatically meanwhile.`, 'warning');
+        },
+      );
+    }
   });
 
   return {

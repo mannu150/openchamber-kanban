@@ -1,77 +1,110 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { HostRequestError, type GuestProject, type GuestSessionsSnapshot } from '@openchamber/sdk';
+import { HostRequestError, type GuestDirectoryCoverage, type GuestProject, type GuestSessionRecord, type GuestSessionsSnapshot, type GuestWorktreesSnapshot } from '@openchamber/sdk';
 import { describeHostError, describeStartSessionDelivery, fetchSessions, fetchWorktrees, projectForDirectory, type WorkspaceHost } from '../src/host/workspace.ts';
 
 const project = (id: string, directory: string): GuestProject => ({ id, name: id, directory });
 
-const sessionsHost = (snapshots: GuestSessionsSnapshot[], onSubscribe?: () => void): WorkspaceHost => ({
-  onProjects: async () => () => {},
-  onWorktrees: async () => () => {},
-  openSession: async () => {},
-  onSessions: async (_projectId, listener) => {
-    onSubscribe?.();
-    for (const snapshot of snapshots) listener(snapshot);
-    return () => {};
-  },
+const session = (id: string, updatedAt: number, overrides: Partial<GuestSessionRecord> = {}): GuestSessionRecord => ({
+  id, title: id.toUpperCase(), projectId: 'p1', directory: '/x', parentId: null, createdAt: 1, updatedAt, archivedAt: null, worktree: null, activity: 'idle', outcome: null, items: [],
+  ...overrides,
 });
 
-test('fetchSessions resolves on the first ready snapshot, newest first, parents only', async () => {
-  const host = sessionsHost([
-    { kind: 'sessions', projectId: 'p1', state: 'loading', coverage: [], sessions: [] },
-    {
-      kind: 'sessions', projectId: 'p1', state: 'ready', coverage: [],
-      sessions: [
-        { id: 'a', title: 'A', projectId: 'p1', directory: '/x', parentId: null, createdAt: 1, updatedAt: 10, archivedAt: null, worktree: null, activity: 'idle', outcome: null, items: [] },
-        { id: 'b', title: 'B', projectId: 'p1', directory: '/x', parentId: null, createdAt: 1, updatedAt: 20, archivedAt: null, worktree: null, activity: 'idle', outcome: null, items: [] },
-        { id: 'sub', title: 'sub', projectId: 'p1', directory: '/x', parentId: 'a', createdAt: 1, updatedAt: 30, archivedAt: null, worktree: null, activity: 'idle', outcome: null, items: [] },
-        { id: 'arch', title: 'arch', projectId: 'p1', directory: '/x', parentId: null, createdAt: 1, updatedAt: 40, archivedAt: 99, worktree: null, activity: 'idle', outcome: null, items: [] },
-      ],
+const unusedRead = async (): Promise<never> => { throw new Error('unexpected read'); };
+
+test('fetchSessions reads once via listSessions, newest first, parents only, archived separated, coverage kept', async () => {
+  const coverage: GuestDirectoryCoverage[] = [{ directory: '/x', state: 'ready' }];
+  let reads = 0;
+  const host: WorkspaceHost = {
+    onProjects: async () => () => {},
+    listSessions: async () => {
+      reads += 1;
+      return {
+        kind: 'sessions', projectId: 'p1', state: 'ready', coverage,
+        sessions: [session('a', 10), session('b', 20), session('sub', 30, { parentId: 'a' }), session('arch', 40, { archivedAt: 99 })],
+      } satisfies GuestSessionsSnapshot;
     },
-  ]);
+    listWorktrees: unusedRead,
+  };
   const result = await fetchSessions(host, 'p1');
   assert.equal(result.complete, true);
   assert.deepEqual(result.sessions.map((s) => s.id), ['b', 'a']);
   assert.deepEqual(result.allSessions.map((s) => s.id), ['arch', 'b', 'a']);
+  assert.deepEqual(result.coverage, coverage);
+  assert.equal(reads, 1);
 });
 
 test('fetchSessions reports incomplete on an error snapshot instead of throwing', async () => {
-  const host = sessionsHost([{ kind: 'sessions', projectId: 'p1', state: 'error', coverage: [], sessions: [] }]);
+  const host: WorkspaceHost = {
+    onProjects: async () => () => {},
+    listSessions: async () => ({ kind: 'sessions', projectId: 'p1', state: 'error', coverage: [], sessions: [] }) as GuestSessionsSnapshot,
+    listWorktrees: unusedRead,
+  };
   const result = await fetchSessions(host, 'p1');
   assert.equal(result.complete, false);
   assert.deepEqual(result.sessions, []);
 });
 
-test('fetchSessions releases its subscription once settled', async () => {
-  let released = false;
+test('fetchSessions retries while the store is loading and resolves once ready', async () => {
+  let reads = 0;
   const host: WorkspaceHost = {
     onProjects: async () => () => {},
-    onWorktrees: async () => () => {},
-    openSession: async () => {},
-    onSessions: async (_id, listener) => {
-      listener({ kind: 'sessions', projectId: 'p1', state: 'ready', coverage: [], sessions: [] });
-      return () => { released = true; };
+    listSessions: async () => {
+      reads += 1;
+      return reads === 1
+        ? { kind: 'sessions', projectId: 'p1', state: 'loading', coverage: [], sessions: [] } as GuestSessionsSnapshot
+        : { kind: 'sessions', projectId: 'p1', state: 'ready', coverage: [], sessions: [session('a', 10)] } as GuestSessionsSnapshot;
     },
+    listWorktrees: unusedRead,
   };
-  await fetchSessions(host, 'p1');
-  assert.equal(released, true);
+  const result = await fetchSessions(host, 'p1');
+  assert.equal(result.complete, true);
+  assert.deepEqual(result.sessions.map((s) => s.id), ['a']);
+  assert.equal(reads, 2);
 });
 
-test('fetchWorktrees resolves on the first ready snapshot and releases its subscription', async () => {
-  let released = false;
+test('fetchSessions hands back the loading snapshot once the deadline passes — incomplete, not empty-trusted', async () => {
+  let reads = 0;
   const host: WorkspaceHost = {
     onProjects: async () => () => {},
-    onSessions: async () => () => {},
-    openSession: async () => {},
-    onWorktrees: async (_id, listener) => {
-      listener({ kind: 'worktrees', projectId: 'p1', state: 'ready', worktrees: [{ directory: '/d', name: 'd', branch: 'b', status: 'ready' }] });
-      return () => { released = true; };
+    listSessions: async () => {
+      reads += 1;
+      return { kind: 'sessions', projectId: 'p1', state: 'loading', coverage: [], sessions: [session('a', 10)] } as GuestSessionsSnapshot;
     },
+    listWorktrees: unusedRead,
+  };
+  const result = await fetchSessions(host, 'p1', 0);
+  assert.equal(result.complete, false);
+  assert.equal(reads, 1);
+});
+
+test('fetchSessions rejects when the read itself fails', async () => {
+  const failure = new HostRequestError('NOT_GRANTED', 'denied');
+  const host: WorkspaceHost = {
+    onProjects: async () => () => {},
+    listSessions: async () => { throw failure; },
+    listWorktrees: unusedRead,
+  };
+  await assert.rejects(fetchSessions(host, 'p1'), failure);
+});
+
+test('fetchWorktrees resolves ready reads and reports incomplete ones', async () => {
+  const ready: GuestWorktreesSnapshot = { kind: 'worktrees', projectId: 'p1', state: 'ready', worktrees: [{ directory: '/d', name: 'd', branch: 'b', status: 'ready' }] };
+  const host: WorkspaceHost = {
+    onProjects: async () => () => {},
+    listSessions: unusedRead,
+    listWorktrees: async () => ready,
   };
   const result = await fetchWorktrees(host, 'p1');
   assert.equal(result.complete, true);
-  assert.deepEqual(result.worktrees, [{ directory: '/d', name: 'd', branch: 'b', status: 'ready' }]);
-  assert.equal(released, true);
+  assert.deepEqual(result.worktrees, ready.worktrees);
+
+  const loadingHost: WorkspaceHost = {
+    onProjects: async () => () => {},
+    listSessions: unusedRead,
+    listWorktrees: async () => ({ kind: 'worktrees', projectId: 'p1', state: 'loading', worktrees: [] }) as GuestWorktreesSnapshot,
+  };
+  assert.equal((await fetchWorktrees(loadingHost, 'p1', 0)).complete, false);
 });
 
 test('projectForDirectory matches exact and nested worktree paths, else null', () => {
