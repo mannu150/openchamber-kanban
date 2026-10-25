@@ -1,6 +1,6 @@
-import { HostRequestError, type GuestProject, type GuestSessionRecord, type GuestSessionsSnapshot, type GuestWorktree, type GuestWorktreesSnapshot, type HostClient, type StartSessionSent } from '@openchamber/sdk';
+import { HostRequestError, type GuestDirectoryCoverage, type GuestProject, type GuestSessionRecord, type GuestSessionsSnapshot, type GuestWorktree, type GuestWorktreesSnapshot, type HostClient, type StartSessionSent } from '@openchamber/sdk';
 
-export type WorkspaceHost = Pick<HostClient, 'onProjects' | 'onSessions' | 'onWorktrees' | 'openSession'>;
+export type WorkspaceHost = Pick<HostClient, 'onProjects' | 'listSessions' | 'listWorktrees'>;
 
 export type ProjectsState = { state: 'loading' | 'ready' | 'error'; projects: GuestProject[] };
 
@@ -8,73 +8,44 @@ export type ProjectsState = { state: 'loading' | 'ready' | 'error'; projects: Gu
 export const watchProjects = async (host: WorkspaceHost, listener: (state: ProjectsState) => void) =>
   host.onProjects((snapshot) => listener({ state: snapshot.state, projects: snapshot.projects }));
 
-export type SessionsResult = { complete: boolean; sessions: GuestSessionRecord[]; allSessions: GuestSessionRecord[] };
+export type SessionsResult = { complete: boolean; coverage: GuestDirectoryCoverage[]; sessions: GuestSessionRecord[]; allSessions: GuestSessionRecord[] };
+
+const SETTLE_RETRY_MS = 500;
 
 /**
- * One-off session list for a project. Subscribes, resolves on the first
- * `ready`/`error` snapshot (or the last one seen after `timeoutMs`), then
- * releases the subscription so it never counts against the 32-per-frame cap.
+ * Reads via `listSessions`/`listWorktrees` instead of a throwaway
+ * subscription: a read never counts against the 32-subscriptions-per-frame
+ * cap, so one feature's live watchers can no longer starve another's list
+ * loads. A read may land while the host store is still `loading`; retries
+ * cheaply until it settles or the deadline passes, then hands back whatever
+ * it has — callers treat incomplete data as "unknown", never as empty.
  */
-export const fetchSessions = (host: WorkspaceHost, projectId: string, timeoutMs = 8000): Promise<SessionsResult> =>
-  new Promise((resolve, reject) => {
-    let last: GuestSessionsSnapshot | null = null;
-    let settled = false;
-    let release: (() => void) | null = null;
-    const finish = (snapshot: GuestSessionsSnapshot | null) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      release?.();
-      const allSessions = (snapshot?.sessions ?? [])
-        .filter((session) => session.parentId === null)
-        .sort((a, b) => b.updatedAt - a.updatedAt);
-      const sessions = allSessions.filter((session) => session.archivedAt === null);
-      resolve({ complete: snapshot?.state === 'ready', sessions, allSessions });
-    };
-    const timer = setTimeout(() => finish(last), timeoutMs);
-    host.onSessions(projectId, (snapshot) => {
-      last = snapshot;
-      if (snapshot.state !== 'loading') finish(snapshot);
-    }).then((stop) => {
-      release = stop;
-      if (settled) stop();
-    }, (error: unknown) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(error);
-    });
-  });
+const readUntilSettled = async <T extends { state: 'loading' | 'ready' | 'error' }>(read: () => Promise<T>, timeoutMs: number): Promise<T> => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const snapshot = await read();
+    if (snapshot.state !== 'loading' || Date.now() >= deadline) return snapshot;
+    await new Promise((resolve) => setTimeout(resolve, SETTLE_RETRY_MS));
+  }
+};
+
+export const fetchSessions = async (host: WorkspaceHost, projectId: string, timeoutMs = 8000): Promise<SessionsResult> => {
+  const snapshot: GuestSessionsSnapshot = await readUntilSettled(() => host.listSessions(projectId), timeoutMs);
+  const allSessions = snapshot.sessions
+    .filter((session) => session.parentId === null)
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+  const sessions = allSessions.filter((session) => session.archivedAt === null);
+  return { complete: snapshot.state === 'ready', coverage: snapshot.coverage, sessions, allSessions };
+};
 
 export type WorktreesResult = { complete: boolean; worktrees: GuestWorktree[] };
 
-/** One-off worktree list for a project, same resolve/release pattern as `fetchSessions`. */
-export const fetchWorktrees = (host: WorkspaceHost, projectId: string, timeoutMs = 8000): Promise<WorktreesResult> =>
-  new Promise((resolve, reject) => {
-    let last: GuestWorktreesSnapshot | null = null;
-    let settled = false;
-    let release: (() => void) | null = null;
-    const finish = (snapshot: GuestWorktreesSnapshot | null) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      release?.();
-      resolve({ complete: snapshot?.state === 'ready', worktrees: snapshot?.worktrees ?? [] });
-    };
-    const timer = setTimeout(() => finish(last), timeoutMs);
-    host.onWorktrees(projectId, (snapshot) => {
-      last = snapshot;
-      if (snapshot.state !== 'loading') finish(snapshot);
-    }).then((stop) => {
-      release = stop;
-      if (settled) stop();
-    }, (error: unknown) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(error);
-    });
-  });
+
+export const fetchWorktrees = async (host: WorkspaceHost, projectId: string, timeoutMs = 8000): Promise<WorktreesResult> => {
+  const snapshot: GuestWorktreesSnapshot = await readUntilSettled(() => host.listWorktrees(projectId), timeoutMs);
+  return { complete: snapshot.state === 'ready', worktrees: snapshot.worktrees };
+};
+
 
 export const projectForDirectory = (projects: readonly GuestProject[], directory: string | null) => {
   if (!directory) return null;

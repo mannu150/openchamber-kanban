@@ -1,6 +1,7 @@
 import type { GuestSessionWorktree } from '@openchamber/sdk';
 import { mountBanner, mountButton, mountList, mountSelect, mountTextField, type SelectOption } from '@openchamber/sdk/ui';
 import { DESCRIPTION_MAX, STATUSES, STATUS_LABELS, TITLE_MAX, type Task, type TaskPatch } from '../domain/task.ts';
+import { describeHostError } from '../host/workspace.ts';
 import {
   branchNameConflictsWithBase,
   buildSessionWorktree,
@@ -66,10 +67,13 @@ export const mountTaskDetail = (root: Element, props: TaskDetailProps) => {
   const errorSlotBottom = el('div');
   errorSlotBottom.hidden = true;
   const bannerBottom = mountBanner(errorSlotBottom, { tone: 'error', title: '' });
-  const showError = (error: unknown) => {
-    const body = error instanceof Error ? error.message : String(error);
-    errorSlotTop.hidden = false; bannerTop.update({ tone: 'error', title: 'Could not save', body });
-    errorSlotBottom.hidden = false; bannerBottom.update({ tone: 'error', title: 'Could not save', body });
+  // The title names what actually failed — a failed session-list load used to
+  // announce itself as "Could not save", which sent users hunting for a save
+  // bug that never existed.
+  const showError = (error: unknown, title = 'Could not save') => {
+    const body = describeHostError(error);
+    errorSlotTop.hidden = false; bannerTop.update({ tone: 'error', title, body });
+    errorSlotBottom.hidden = false; bannerBottom.update({ tone: 'error', title, body });
   };
   const clearError = () => { errorSlotTop.hidden = true; errorSlotBottom.hidden = true; };
 
@@ -158,11 +162,11 @@ export const mountTaskDetail = (root: Element, props: TaskDetailProps) => {
     sessionBody.append(el('span', 'kb-mono', props.task.sessionId));
     mountButton(sessionBody, {
       label: 'Open Chat',
-      onClick: () => { void props.onOpenChat(props.task.sessionId!).catch(showError); },
+      onClick: () => { void props.onOpenChat(props.task.sessionId!).catch((error) => showError(error, 'Could not open the chat')); },
     });
     mountButton(sessionBody, {
       label: 'Unlink', variant: 'ghost',
-      onClick: () => { void props.onUnlinkSession().catch(showError); },
+      onClick: () => { void props.onUnlinkSession().catch((error) => showError(error, 'Could not unlink the session')); },
     });
   };
   renderSessionBody();
@@ -283,7 +287,7 @@ export const mountTaskDetail = (root: Element, props: TaskDetailProps) => {
             // Whatever is currently typed, saved or not — Start Agent must not silently
             // fall back to the title/description this task had when the popup opened.
             await props.onStartAgent({ projectId, worktree, title, description });
-          } catch (error) { showError(error); }
+          } catch (error) { showError(error, 'Could not start the agent'); }
           finally { startBusy = false; startButton.update({ loading: false }); }
         })();
       },
@@ -320,7 +324,7 @@ export const mountTaskDetail = (root: Element, props: TaskDetailProps) => {
         if (info.destinations.length === 0) existingWorktreeNote.textContent = 'No existing worktrees in this project yet.';
         baseBranchSelect.update({ options: info.baseBranches });
         baseBranchNote.textContent = info.hasKnownBranches ? '' : noKnownBranchesNote;
-      }, (error) => { if (generation === worktreeGeneration) showError(error); });
+      }, (error) => { if (generation === worktreeGeneration) showError(error, 'Could not load worktrees'); });
     };
     refreshWorktreeOptions();
   }
@@ -338,7 +342,7 @@ export const mountTaskDetail = (root: Element, props: TaskDetailProps) => {
     const list = mountList(pickerRoot, {
       ariaLabel: 'Sessions available to link',
       items: [], emptyText: 'Loading sessions…',
-      onSelect: (id) => { void props.onLinkSession(id, projectId || null).catch(showError); },
+      onSelect: (id) => { void props.onLinkSession(id, projectId || null).catch((error) => showError(error, 'Could not link the session')); },
     });
     picker = list;
     void props.loadSessionsForProject(projectId).then((sessions) => {
@@ -347,7 +351,8 @@ export const mountTaskDetail = (root: Element, props: TaskDetailProps) => {
         items: sessions.map((s) => ({ id: s.id, title: s.title, subtitle: s.id, badge: { label: s.activity, tone: s.activity === 'running' ? 'info' : 'neutral' } })),
         emptyText: 'No sessions in this project yet.',
       });
-    }, (error) => { if (generation === pickerGeneration) showError(error); });
+    }, (error) => { if (generation === pickerGeneration) showError(error, 'Could not load sessions'); });
+
   };
   const refreshSessionPicker = () => { renderPicker(); };
   renderPicker();
@@ -360,7 +365,7 @@ export const mountTaskDetail = (root: Element, props: TaskDetailProps) => {
     label: 'Delete task', variant: 'ghost',
     onClick: () => {
       if (!confirmingDelete) { confirmingDelete = true; deleteBtn.update({ label: 'Click again to delete', variant: 'destructive' }); return; }
-      void props.onDelete().catch(showError);
+      void props.onDelete().catch((error) => showError(error, 'Could not delete the task'));
     },
   });
   mountButton(footer, { label: 'Close', variant: 'outline', onClick: () => props.onClose() });
